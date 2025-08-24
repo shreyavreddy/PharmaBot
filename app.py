@@ -2,137 +2,187 @@ import streamlit as st
 import cohere
 from dotenv import load_dotenv
 import os
-import speech_recognition as sr  # For voice input
-import re  # For parsing medicines
+import speech_recognition as sr
+import re
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
 
-# Load environment variables
+# ---------- PAGE CUSTOM STYLING ----------
+st.markdown("""
+<style>
+.main-title {font-size:2.7em;font-weight:800;color:#ED145B;margin-bottom:7px}
+.sub-title {font-size:1.15em;color:#444;margin-bottom:22px}
+.ml-pred {background:#F2F8FD;padding:10px 16px;border-radius:8px;margin-bottom:10px;font-size:1.1em;color:#0884fc;display:inline-block}
+.advice-card {background:#F7F9FA;border-radius:10px;padding:18px 23px 14px 23px;box-shadow:0 4px 12px #0001}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- ENV / API ----------
 load_dotenv()
-cohere_api_key = os.getenv('COHERE_API_KEY')
-co = cohere.Client(cohere_api_key)
+co = cohere.Client(os.getenv("COHERE_API_KEY").strip())
 
-# Load and train ML model (runs once on app start)
-@st.cache_resource  # Cache for efficiency
-def train_ml_model():
-    # Use absolute path to ensure it finds the CSV
-    csv_path = r"C:\Users\Shreya Reddy\PHARMABOT\symptom_data.csv"  # Matches your provided path
-    data = pd.read_csv(csv_path)  # Assumes columns: 'text' (symptoms), 'label' (disease)
-    X = data['text']  # Updated to match actual dataset column
-    y = data['label']
-    
-    # Split and train simple classifier
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = Pipeline([
-        ('tfidf', TfidfVectorizer()),
-        ('clf', LogisticRegression())
-    ])
-    model.fit(X_train, y_train)
-    return model
+# ---------- DATA ----------
+@st.cache_resource
+def load_symptom_data():
+    csv_path = r"C:\Users\Shreya Reddy\PHARMABOT\symptom_data.csv"  # adjust if needed
+    return pd.read_csv(csv_path)       # must contain columns: text , label
 
-ml_model = train_ml_model()
+symptom_df = load_symptom_data()
 
-# Function for refined prompt (updated to avoid repetition and ensure completeness)
-def generate_prompt(symptoms, ml_prediction):
-    return f"""
-You are PharmaBot, a friendly AI health assistant for rural India. Start with: 'This is not professional medical advice. Consult a doctor.' Do not repeat this disclaimer.
+# ---------- WORD CLEAN / STOPWORDS ----------
+STOP = {
+    "and","or","the","is","a","an","to","of","in","on","for","with","that",
+    "this","these","those","have","has","had","be","been","being"
+}
+tok_pat = re.compile(r"[a-z]+")
 
-User symptoms: {symptoms}
-ML-predicted condition: {ml_prediction} (for reference only)
+def tokenize(s: str):
+    return {w for w in tok_pat.findall(s.lower()) if len(w) >= 4 and w not in STOP}
 
-Respond in this structure:
-1. **Possible Causes**: 1-2 simple reasons.
-2. **Suggested OTC Medicines**: 1-2 Indian brands.
-3. **Home Remedies**: 1-2 easy tips.
-4. **When to See a Doctor**: Warnings.
+# ---------- PREDICT BY WORD OVERLAP ----------
+def predict_disease(user_input: str, df: pd.DataFrame):
+    uwords = tokenize(user_input)
+    max_overlap, best_label = 0, None
+    for _, row in df.iterrows():
+        sw = tokenize(str(row["text"]))
+        ov = len(uwords & sw)
+        if ov > max_overlap:
+            max_overlap = ov
+            best_label = row["label"]
+    return best_label if max_overlap > 0 else None   # strict: at least ONE real overlap
 
-Rules: Simple English, empathetic, under 200 words. For serious symptoms, advise doctor immediately. End with a brief summary.
+# ---------- VALIDATE WITH COHERE ----------
+def is_valid_symptom_input(co, user_input: str):
+    prompt = f"""
+You are a medical expert. Determine if the following text is a valid description of medical symptoms.
+- Respond ONLY with 'YES' if it describes actual symptoms (e.g., 'fever headache cold').
+- Respond ONLY with 'NO' if it's nonsense, questions, or not symptoms (e.g., 'how to dance', 'what is cohere').
+- Do not explain.
+
+Text: {user_input}
 """
+    response = co.generate(
+        model="command",
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0
+    ).generations[0].text.strip()
+    return response == "YES"
 
-# Streamlit app config
-st.set_page_config(page_title="💊 PharmaBot", page_icon="💊", layout="wide")
-st.title("💊 PharmaBot - AI Health Assistant")
-st.markdown("Describe your symptoms in simple words or use voice input. I'll provide helpful advice!")
-
-# Sidebar for notes and voice input
+# ---------- STREAMLIT LAYOUT ----------
+st.sidebar.image("https://img.icons8.com/color/96/pill.png", width=70)
 st.sidebar.title("Important")
-st.sidebar.markdown("**Note:** This is for educational use only. Always see a doctor.")
-if st.sidebar.button("🎤 Record Voice"):
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        st.sidebar.info("Listening... Speak your symptoms (say 'stop' to end).")
-        try:
-            audio = recognizer.listen(source, timeout=10)  # Listen for up to 10 seconds
-            symptoms = recognizer.recognize_google(audio)  # Convert to text using Google API
-            st.sidebar.success(f"You said: {symptoms}")
-        except sr.UnknownValueError:
-            st.sidebar.error("Sorry, couldn't understand the audio. Try again.")
-            symptoms = None
-        except sr.RequestError:
-            st.sidebar.error("Voice service unavailable. Please type instead.")
-            symptoms = None
-else:
-    symptoms = None
+st.sidebar.warning("This is for educational use only. Always see a doctor.")
+st.sidebar.info("Tip: Use voice input for hands-free experience.")
+st.set_page_config(page_title="PharmaBot", page_icon="💊", layout="wide")
+st.markdown('<div class="main-title">💊 PharmaBot – AI Health Assistant</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Describe your symptoms or use voice!</div>', unsafe_allow_html=True)
 
-# Initialize chat history
+# ---------- VOICE INPUT ----------
+if st.sidebar.button("🎤 Record Voice"):
+    r = sr.Recognizer()
+    with sr.Microphone() as src:
+        st.sidebar.info("Listening …")
+        try:
+            audio = r.listen(src, timeout=10)
+            voice_symptoms = r.recognize_google(audio)
+            st.sidebar.success(f"You said: {voice_symptoms}")
+        except Exception:
+            st.sidebar.error("Voice recognition failed; please type.")
+            voice_symptoms = None
+else:
+    voice_symptoms = None
+
+# ---------- CHAT HISTORY ----------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-# User input as chat (text or from voice)
-text_symptoms = st.chat_input("Your symptoms:")
-if text_symptoms:
-    symptoms = text_symptoms  # Prioritize text input if provided
+# ---------- USER INPUT ----------
+typed_symptoms = st.chat_input("Your symptoms:")
+symptoms = typed_symptoms or voice_symptoms
 
+# ---------- MAIN LOGIC ----------
 if symptoms:
-    # Validate input
-    if len(symptoms.strip()) < 5:
-        st.warning("Please provide more details about your symptoms.")
-    else:
-        st.session_state.messages.append({"role": "user", "content": symptoms})
-        with st.chat_message("user"):
-            st.markdown(symptoms)
-        
-        # ML Prediction
-        with st.spinner("Predicting with ML..."):
-            ml_prediction = ml_model.predict([symptoms])[0]
-            st.info(f"ML Prediction: Possible {ml_prediction} (experimental— not a diagnosis)")
-        
-        # Generate advice with ML input (updated params for complete responses)
-        with st.spinner("Analyzing..."):
-            response = co.generate(model='command', prompt=generate_prompt(symptoms, ml_prediction), max_tokens=500, temperature=0.7)
-            advice = response.generations[0].text.strip()
-            
-            # Fallback
-            if not advice or len(advice) < 50:
-                advice = "Sorry, couldn't analyze. Try again or see a doctor."
-        
-        st.session_state.messages.append({"role": "assistant", "content": advice})
-        with st.chat_message("assistant"):
-            st.markdown(advice)
-            
-            # Flexible extraction for OTC section
-            otc_section = re.search(r"(?:Suggested OTC Medicines|OTC Medicines):?\s*(.*?)(?=(?:Home Remedies|When to See a Doctor)|\Z)", advice, re.DOTALL | re.IGNORECASE)
-            if otc_section:
-                otc = otc_section.group(1).strip()
-                medicines = re.findall(r'([A-Za-z0-9\s]+(?:\s*\([A-Za-z0-9\s]+\))?)', otc)  # Catches names like "Ibuprofen (Advil)"
-                medicines = [med.strip() for med in medicines if len(med.strip()) > 5 and 'such as' not in med]  # Filter noise
-                if medicines:
-                    with st.expander("🛒 Buy Suggested Medicines (External Links)"):
-                        st.markdown("**Note:** These links open trusted sites—verify availability and consult a pharmacist before purchase.")
-                        for med in medicines:
-                            search_url = f"https://www.pharmeasy.in/search/all?name={med.replace(' ', '%20')}"
-                            st.markdown(f"- {med}: [Buy on PharmEasy]({search_url})", unsafe_allow_html=True)
-        
-        st.warning("Remember: AI-generated advice. Consult a professional.")
+    s_clean = symptoms.strip()
+    st.session_state.messages.append({"role": "user", "content": "🗣️ " + s_clean})
+    with st.chat_message("user"):
+        st.markdown("🗣️ " + s_clean)
 
-# Footer
+    if len(s_clean) < 5:
+        st.warning("Please provide more descriptive symptoms (≥ 5 characters).")
+    else:
+        with st.spinner("Validating input …"):
+            is_valid = is_valid_symptom_input(co, s_clean)
+
+        if not is_valid:
+            st.error("⚠️  Input does not describe valid medical symptoms. "
+                     "Please list real symptoms separated by spaces or commas "
+                     "(e.g., 'fever headache cold').")
+        else:
+            with st.spinner("Matching symptoms …"):
+                disease = predict_disease(s_clean, symptom_df)
+
+            if disease is None:
+                st.error("⚠️  Could not match your input to any known symptoms. "
+                         "Please list real symptoms separated by spaces or commas "
+                         "(e.g., 'fever headache cold').")
+            else:
+                # ---------- DISPLAY PREDICTION ----------
+                st.markdown(f'<div class="ml-pred">🔎 **Predicted Disease:** {disease} '
+                            f'</div>', unsafe_allow_html=True)
+
+                # ---------- LLM PROMPT ----------
+                def prompt(sym, dis):
+                    return f"""
+You are PharmaBot, a friendly AI health assistant for rural India.
+Start with: 'This is not professional medical advice. Consult a doctor.' Do not repeat this disclaimer.
+
+User symptoms: {sym}
+Predicted disease (treat as ground truth): {dis}
+
+Respond in this structure:
+🩺 **Why It Happened (Possible Causes)**: 1-2 points.
+💊 **Suggested OTC Medicines**: 1-2 Indian brands, comma-separated, no explanations.
+🛡️ **Precautions and Home Remedies**: 1-2 short tips.
+⚠️ **When to See a Doctor**: Warnings.
+
+Rules: ≤ 200 words, simple empathetic English, allopathic OTC only.
+"""
+
+                with st.spinner("Generating advice …"):
+                    advice = co.generate(
+                        model="command",
+                        prompt=prompt(s_clean, disease),
+                        max_tokens=500,
+                        temperature=0.7
+                    ).generations[0].text.strip()
+
+                st.session_state.messages.append({"role": "assistant", "content": advice})
+                with st.chat_message("assistant"):
+                    st.markdown(f'<div class="advice-card">{advice}</div>', unsafe_allow_html=True)
+
+                    # ---------- OTC LINKS ----------
+                    otc_match = re.search(
+                        r"(?:Suggested OTC Medicines|OTC Medicines):?\s*(.*?)(?=(?:Precautions|When to See a Doctor)|$)",
+                        advice,
+                        flags=re.I | re.S
+                    )
+                    if otc_match:
+                        meds = [m.strip() for m in otc_match.group(1).split(",") if len(m.strip()) > 2]
+                        meds = list(dict.fromkeys(meds))
+                        if meds:
+                            with st.expander("🛒 Buy Suggested Medicines"):
+                                st.markdown("**Note:** Verify with a pharmacist before buying.")
+                                for m in meds:
+                                    url1 = f"https://www.pharmeasy.in/search/all?name={m.replace(' ','%20')}"
+                                    url2 = f"https://www.apollopharmacy.in/search-medicines/{m.replace(' ','%20')}"
+                                    st.markdown(f"- **{m}**: [PharmEasy]({url1}) | [Apollo]({url2})",
+                                                unsafe_allow_html=True)
+
+                st.warning("Remember: This is never a substitute for professional medical advice.")
+
 st.markdown("---")
-st.caption("Powered by Streamlit, Cohere, and scikit-learn. Project by [Your Name].")
+st.caption("Powered by Streamlit · Cohere · Project by SHREYA")
